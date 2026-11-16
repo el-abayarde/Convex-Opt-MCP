@@ -135,7 +135,7 @@ For this equality-constrained problem the result can be checked against the clos
 ## Development
 
 ```bash
-git clone <repo-url> && cd convex-opt-mcp
+git clone https://github.com/el-abayarde/Convex-Opt-MCP.git && cd Convex-Opt-MCP
 python -m pip install -e ".[test]"
 pytest
 ```

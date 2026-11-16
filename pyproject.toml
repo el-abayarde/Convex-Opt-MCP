@@ -40,10 +40,10 @@ test = ["pytest"]
 [project.scripts]
 convex-opt-mcp = "convex_opt_mcp.server:main"
 
-# Fill these in once the GitHub repo exists:
-# [project.urls]
-# Homepage = "https://github.com/<you>/convex-opt-mcp"
-# Issues = "https://github.com/<you>/convex-opt-mcp/issues"
+[project.urls]
+Homepage = "https://github.com/el-abayarde/Convex-Opt-MCP"
+Repository = "https://github.com/el-abayarde/Convex-Opt-MCP"
+Issues = "https://github.com/el-abayarde/Convex-Opt-MCP/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["convex_opt_mcp"]
