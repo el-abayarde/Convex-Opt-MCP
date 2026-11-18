@@ -69,16 +69,39 @@ Stored parameters live in the server process's memory, so their lifetime is the 
 
 Every tool result includes a `server` block — process id, start time, uptime, version and the names currently stored — so you can tell whether two calls reached the same process. `load_parameter` only reads files inside the allowed data folders: your home folder by default, or the folders listed in the `CONVEX_OPT_MCP_DATA_DIRS` environment variable (separated by `:` on macOS/Linux). Symlinks are resolved before the check. Files are loaded as numbers only (`.npy`/`.npz` with pickling disabled).
 
+### Solve options
+
+`solve_problem` passes these through to CVXPY's `Problem.solve()`:
+
+| Argument | Meaning |
+|---|---|
+| `solver` | Solver to use, e.g. `"CLARABEL"`, `"SCS"`, `"OSQP"`, `"HIGHS"` (`list_solvers` shows what's installed) |
+| `solver_options` | Solver-specific options, passed as keyword arguments, e.g. `{"max_iter": 20000, "eps_abs": 1e-8}` for OSQP, `{"time_limit": 10}` for CLARABEL or HIGHS, `{"scipy_options": {"method": "highs"}}` for SCIPY |
+| `solver_path` | Solvers to try in order until one runs without error, instead of `solver`: `["CLARABEL", {"solver": "SCS", "options": {"max_iters": 10000}}]`. Results list each attempt |
+| `gp` | Solve as a disciplined geometric program. Variables need `"pos": true`; products and powers of variables become allowed. Duals are log-log sensitivities: loosening a constraint by 1% improves the optimum by about *y*% |
+| `qcp` | Solve as a disciplined quasiconvex program (e.g. `cp.ceil`, ratios) by bisection. No duals are reported |
+| `verbose` | Solver output, written to the server's log |
+
+Option values can be numbers, strings, booleans, or lists/objects of those. Options that need Python objects (callables, protobuf messages, solver environments) can't be sent over JSON. `warm_start`, `enforce_dpp`, `ignore_dpp` and `requires_grad` aren't offered, because the server rebuilds each problem from scratch with constant data.
+
+Safeguards:
+
+- **File options are refused.** Options whose names refer to files, paths or folders (HiGHS `log_file`, `write_model_file`, SCS `write_data_filename`, …) return `invalid_options`, since a model chooses them. Set `CONVEX_OPT_MCP_ALLOW_FILE_OPTIONS=1` in the server's environment to allow them.
+- **Optional default time limit.** Set `CONVEX_OPT_MCP_TIME_LIMIT` (seconds) to add a time limit to every solve with CLARABEL, OSQP, SCS or HIGHS, unless the call sets its own. It can't apply when no solver is named, because the option's name depends on the solver CVXPY picks.
+- Tool arguments (`gp`, `qcp`, `solver`, `verbose`, `solver_path`) can't be smuggled inside `solver_options`.
+
+The options actually used, including any server default, are reported in `diagnostics.options_used`.
+
 ### Results
 
 `solve_problem` returns:
 
 | Field | Meaning |
 |---|---|
-| `status` | CVXPY status (`optimal`, `optimal_inaccurate`, `infeasible`, `unbounded`, …) or `build_error` / `not_dcp` / `solver_error` with an `error` message |
-| `optimal_value` | Objective value (`null` when infeasible or unbounded) |
+| `status` | CVXPY status (`optimal`, `optimal_inaccurate`, `infeasible`, `unbounded`, …) or `build_error` / `invalid_options` / `not_dcp` / `not_dgp` / `not_dqcp` / `solver_error` with an `error` message |
+| `optimal_value` | Objective value; `null` unless the status is `optimal` or `optimal_inaccurate` (an iteration or time limit leaves only an unfinished iterate) |
 | `variables`, `duals` | Values per variable and per constraint (keyed by the constraint string); only for `optimal` / `optimal_inaccurate` |
-| `diagnostics` | Solver name, solve/setup/compile times, iteration count, and the largest constraint violation at the returned point |
+| `diagnostics` | Solver name, solve/setup/compile times, iteration count, the largest constraint violation at the returned point, the options used, and (with `solver_path`) each attempt |
 | `parameters_from_store` | Names taken from the parameter store rather than passed inline |
 | `parameters_from_files` | Parameters read from file references in this call, with their resolved paths |
 | `server` | Process id, start time, uptime, version and stored names (on every tool's result) |

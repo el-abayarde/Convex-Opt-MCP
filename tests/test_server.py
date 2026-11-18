@@ -566,3 +566,149 @@ def test_schema_offers_file_references():
     branches = schema["properties"]["problem"]["properties"]["parameters"]["additionalProperties"]["anyOf"]
     file_branch = [b for b in branches if b.get("type") == "object"]
     assert file_branch and file_branch[0]["required"] == ["file"]
+
+
+# --- solve options: solver_options, solver_path, gp, qcp ----------------------
+
+from convex_opt_mcp.server import _check_options, _is_file_option, _with_time_limit
+
+GP_PROBLEM = dict(
+    variables=[{"name": "x", "shape": [3], "pos": True}],
+    sense="minimize",
+    objective="cp.sum(x**2)",
+    constraints=["x >= 1", "x[0] * x[1] <= 5"],
+)
+
+
+def test_solver_options_reach_the_solver():
+    res = solve_problem(mean_variance(1.0), solver="CLARABEL", solver_options={"max_iter": 200})
+    assert res.status == "optimal"
+    assert res.diagnostics.solver == "CLARABEL"
+    assert res.diagnostics.options_used == {
+        "solver": "CLARABEL", "gp": False, "qcp": False, "solver_options": {"max_iter": 200}
+    }
+
+
+def test_iteration_limit_option_takes_effect():
+    # Needs an inequality: with only Σw = 1, Clarabel solves the KKT system with 0 iterations.
+    spec = mean_variance(1.0)
+    spec.constraints.append("w >= 0")
+    res = solve_problem(spec, solver="CLARABEL", solver_options={"max_iter": 1})
+    assert res.status == "user_limit"
+    assert res.diagnostics.num_iters == 1
+    # an unfinished iterate is not reported as an answer
+    assert res.optimal_value is None and res.variables is None and res.duals is None
+
+
+def test_unknown_solver_option_is_a_solver_error():
+    res = solve_problem(mean_variance(1.0), solver="CLARABEL", solver_options={"not_a_real_option": 1})
+    assert res.status == "solver_error"
+    assert "not_a_real_option" in res.error
+    assert res.diagnostics is None  # nothing ran, so no empty diagnostics block
+
+
+@pytest.mark.parametrize("name", ["gp", "qcp", "solver", "verbose", "solver_path"])
+def test_tool_arguments_cannot_hide_in_solver_options(name):
+    res = solve_problem(mean_variance(1.0), solver_options={name: True})
+    assert res.status == "invalid_options" and name in res.error
+
+
+@pytest.mark.parametrize(
+    "options",
+    [{"log_file": "/tmp/x.log"}, {"write_model_file": "/tmp/m.mps"}, {"highs_options": {"solution_file": "/tmp/s"}}],
+)
+def test_file_options_are_refused(options):
+    res = solve_problem(mean_variance(1.0), solver="HIGHS", solver_options=options)
+    assert res.status == "invalid_options" and "CONVEX_OPT_MCP_ALLOW_FILE_OPTIONS" in res.error
+
+
+def test_file_options_can_be_allowed(monkeypatch):
+    monkeypatch.setenv("CONVEX_OPT_MCP_ALLOW_FILE_OPTIONS", "1")
+    _check_options({"log_file": "/tmp/x.log"}, "test")  # no error
+
+
+@pytest.mark.parametrize(
+    "name, is_file",
+    [("use_indirect", False), ("log_to_console", False), ("eps_abs", False), ("time_limit", False),
+     ("log_file", True), ("logFile", True), ("write_data_filename", True), ("MSK_IPAR_WRITE_DATA_FORMAT", True)],
+)
+def test_file_option_detection(name, is_file):
+    assert _is_file_option(name) is is_file
+
+
+def test_option_conflicts_are_reported():
+    assert solve_problem(mean_variance(1.0), gp=True, qcp=True).status == "invalid_options"
+    assert solve_problem(mean_variance(1.0), solver="SCS", solver_path=["CLARABEL"]).status == "invalid_options"
+    res = solve_problem(mean_variance(1.0), solver_path=["CLARABEL"], solver_options={"max_iter": 5})
+    assert res.status == "invalid_options"
+    assert solve_problem(mean_variance(1.0), solver_path=[]).status == "invalid_options"
+
+
+def test_solver_path_falls_back_to_the_next_solver():
+    res = solve_problem(mean_variance(1.0), solver_path=["NOT_A_SOLVER", {"solver": "CLARABEL", "options": {}}])
+    assert res.status == "optimal"
+    assert res.diagnostics.solver == "CLARABEL"
+    assert [(a["solver"], a["ok"]) for a in res.diagnostics.attempts] == [("NOT_A_SOLVER", False), ("CLARABEL", True)]
+
+
+def test_solver_path_all_failing_is_a_solver_error():
+    res = solve_problem(mean_variance(1.0), solver_path=["NOPE_1", "NOPE_2"])
+    assert res.status == "solver_error"
+    assert len(res.diagnostics.attempts) == 2 and "NOPE_2" in res.error
+
+
+def test_default_time_limit_is_added_unless_given(monkeypatch):
+    monkeypatch.setenv("CONVEX_OPT_MCP_TIME_LIMIT", "5")
+    assert _with_time_limit("CLARABEL", {}) == {"time_limit": 5.0}
+    assert _with_time_limit("scs", {}) == {"time_limit_secs": 5.0}
+    assert _with_time_limit("CLARABEL", {"time_limit": 1}) == {"time_limit": 1}
+    assert _with_time_limit(None, {}) == {}  # solver chosen by CVXPY: unknown option name
+    res = solve_problem(mean_variance(1.0), solver="CLARABEL")
+    assert res.status == "optimal" and res.diagnostics.options_used["solver_options"] == {"time_limit": 5.0}
+
+
+def test_no_default_time_limit_without_env(monkeypatch):
+    monkeypatch.delenv("CONVEX_OPT_MCP_TIME_LIMIT", raising=False)
+    assert _with_time_limit("CLARABEL", {}) == {}
+
+
+def test_geometric_program():
+    res = solve_problem(ProblemSpec(**GP_PROBLEM), gp=True)
+    assert res.status == "optimal"
+    assert res.optimal_value == pytest.approx(3.0, abs=1e-4)
+    np.testing.assert_allclose(res.variables["x"], [1, 1, 1], atol=1e-4)
+    assert res.diagnostics.options_used["gp"] is True
+    # log-log duals: d log(f) / d log(bound) = (df/dx_i) * x_i / f = 2 * 1 / 3
+    np.testing.assert_allclose(res.duals["x >= 1"], [2 / 3] * 3, atol=1e-3)
+    assert abs(res.duals["x[0] * x[1] <= 5"]) < 1e-6  # inactive
+
+
+def test_geometric_program_needs_gp_flag_and_pos_variables():
+    assert solve_problem(ProblemSpec(**GP_PROBLEM)).status == "not_dcp"
+    spec = ProblemSpec(**{**GP_PROBLEM, "variables": [{"name": "x", "shape": [3]}]})
+    res = solve_problem(spec, gp=True)
+    assert res.status == "not_dgp" and "pos" in res.error
+
+
+def test_check_problem_reports_problem_classes():
+    info = check_problem(ProblemSpec(**GP_PROBLEM))
+    assert info.ok and not info.is_dcp and info.is_dgp
+
+
+def test_quasiconvex_program():
+    spec = ProblemSpec(
+        variables=[{"name": "x", "shape": []}],
+        sense="minimize",
+        objective="cp.ceil(x)",
+        constraints=["x >= 1.3", "x <= 10"],
+    )
+    assert solve_problem(spec).status == "not_dcp"
+    assert check_problem(spec).is_dqcp
+    res = solve_problem(spec, qcp=True)
+    assert res.status == "optimal" and res.optimal_value == pytest.approx(2.0, abs=1e-4)
+    assert 1.3 - 1e-6 <= res.variables["x"] <= 2.0 + 1e-6  # any x in [1.3, 2] is optimal
+
+
+def test_qcp_rejects_non_quasiconvex():
+    spec = scalar_problem("maximize", "cp.square(x)", "x <= 1")
+    assert solve_problem(spec, qcp=True).status == "not_dqcp"

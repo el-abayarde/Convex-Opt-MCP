@@ -21,6 +21,7 @@ import ast
 import copy
 import json
 import os
+import re
 import time
 from datetime import datetime
 from pathlib import Path
@@ -142,6 +143,8 @@ class VariableSpec(BaseModel):
         default_factory=list, description="[] for a scalar, [n] for a vector, [m, n] for a matrix"
     )
     nonneg: bool = Field(False, description="Constrain all entries to be >= 0")
+    pos: bool = Field(False, description="Entries > 0 (required for geometric programs, gp=true)")
+    neg: bool = Field(False, description="Entries < 0")
     boolean: bool = Field(False, description="Entries in {0, 1} (needs a mixed-integer solver such as HIGHS)")
     integer: bool = Field(False, description="Integer entries (needs a mixed-integer solver such as HIGHS)")
     symmetric: bool = Field(False, description="Symmetric square matrix")
@@ -159,6 +162,24 @@ class FileRef(BaseModel):
     key: str | None = Field(None, description="Array name in a .npz file, or top-level field in a .json file")
     delimiter: str | None = Field(None, description="Column separator for .csv/.tsv/.txt if not the default")
     skip_header: int = Field(0, description="Header rows to skip in .csv/.tsv/.txt")
+
+
+# Solver options are passed to CVXPY as keyword arguments. Over JSON they can only
+# be numbers, strings, booleans, or lists/objects of those; options that need
+# Python objects (callables, protobufs, solver environments) can't be sent.
+OptionScalar = Union[bool, int, float, str]
+OptionValue = Union[OptionScalar, list[OptionScalar], dict[str, OptionScalar]]
+
+
+class SolverChoice(BaseModel):
+    """One entry of solver_path: a solver plus its own options."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    solver: str = Field(description="Solver name, e.g. 'SCS'")
+    options: dict[str, OptionValue] = Field(
+        default_factory=dict, description="Options for this solver, e.g. {'max_iters': 10000}"
+    )
 
 
 class ProblemSpec(BaseModel):
@@ -246,7 +267,8 @@ class CheckResult(_Reply):
     ok: bool
     error: str | None = None
     is_dcp: bool | None = None
-    is_dgp: bool | None = None
+    is_dgp: bool | None = Field(None, description="Valid as a geometric program (solve with gp=true)")
+    is_dqcp: bool | None = Field(None, description="Valid as a quasiconvex program (solve with qcp=true)")
     is_mixed_integer: bool | None = None
     objective_curvature: str | None = None
     objective_is_dcp: bool | None = None
@@ -270,6 +292,14 @@ class Diagnostics(BaseModel):
     max_constraint_violation: float | None = Field(
         None, description="Largest constraint residual at the returned point (0 = exactly feasible)"
     )
+    options_used: dict[str, Any] | None = Field(
+        None,
+        description="Settings actually passed to CVXPY: solver, gp, qcp and solver options "
+        "(including any server default such as a time limit)",
+    )
+    attempts: list[dict[str, Any]] | None = Field(
+        None, description="With solver_path: each solver tried, in order, and the error if it failed"
+    )
 
 
 class SolveResult(_Reply):
@@ -277,7 +307,7 @@ class SolveResult(_Reply):
         description=(
             "CVXPY status (optimal, optimal_inaccurate, infeasible, infeasible_inaccurate, "
             "unbounded, unbounded_inaccurate, infeasible_or_unbounded, user_limit, solver_error) "
-            "or a server-side failure (build_error, not_dcp)"
+            "or a server-side failure (build_error, invalid_options, not_dcp, not_dgp, not_dqcp)"
         )
     )
     error: str | None = None
@@ -469,7 +499,7 @@ def _build(
             raise ValueError(f"Duplicate variable name {vs.name!r}")
         if vs.name in ns:
             raise ValueError(f"Variable {vs.name!r} clashes with a parameter of the same name")
-        attrs = {a: True for a in ("nonneg", "boolean", "integer", "symmetric", "PSD") if getattr(vs, a)}
+        attrs = {a: True for a in ("nonneg", "pos", "neg", "boolean", "integer", "symmetric", "PSD") if getattr(vs, a)}
         variables[vs.name] = ns[vs.name] = cp.Variable(tuple(vs.shape), name=vs.name, **attrs)
 
     obj_expr = _safe_eval(spec.objective, ns)
@@ -524,6 +554,82 @@ def _max_violation(constraints: list) -> float | None:
     except Exception:  # some cones don't report violations; don't fail the solve
         return None
     return worst
+
+
+# ==========================================================================
+# Solve options
+# ==========================================================================
+
+# Arguments of solve_problem itself; passing them inside solver options would
+# bypass the checks below or clash with CVXPY's own keywords.
+_RESERVED_OPTION_NAMES = {
+    "solver", "solver_path", "verbose", "gp", "qcp", "requires_grad", "enforce_dpp", "ignore_dpp",
+}
+
+# Option-name words that indicate reading or writing files (HiGHS log_file,
+# write_model_file, SCS write_data_filename, MOSEK *_WRITE_* parameters, ...).
+_FILE_WORDS = {"file", "filename", "filepath", "path", "dir", "directory", "folder", "write", "save", "dump"}
+
+# Per-solver name of the time-limit option used for CONVEX_OPT_MCP_TIME_LIMIT.
+_TIME_LIMIT_OPTION = {"CLARABEL": "time_limit", "OSQP": "time_limit", "SCS": "time_limit_secs", "HIGHS": "time_limit"}
+
+
+def _option_words(name: str) -> list[str]:
+    words = []
+    for part in re.split(r"[^A-Za-z0-9]+", name):
+        words += re.findall(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|[0-9]+", part)
+    return [w.lower() for w in words]
+
+
+def _is_file_option(name: str) -> bool:
+    words = _option_words(name)
+    return any(w in _FILE_WORDS or w.endswith(("file", "filename", "path")) for w in words)
+
+
+def _file_options_allowed() -> bool:
+    return os.environ.get("CONVEX_OPT_MCP_ALLOW_FILE_OPTIONS", "").strip().lower() in ("1", "true", "yes")
+
+
+def _check_options(options: dict[str, Any], where: str) -> None:
+    def walk(opts: dict[str, Any], top: bool) -> None:
+        for key, value in opts.items():
+            if top and key in _RESERVED_OPTION_NAMES:
+                raise ValueError(
+                    f"{where}: {key!r} is an argument of solve_problem itself; pass it directly, "
+                    "not inside solver options"
+                )
+            if _is_file_option(key) and not _file_options_allowed():
+                raise ValueError(
+                    f"{where}: option {key!r} looks like it reads or writes files, which is disabled. "
+                    "Set CONVEX_OPT_MCP_ALLOW_FILE_OPTIONS=1 in the server's environment to allow it."
+                )
+            if isinstance(value, dict):
+                walk(value, top=False)
+
+    walk(options, top=True)
+
+
+def _with_time_limit(solver: str | None, options: dict[str, Any]) -> dict[str, Any]:
+    """Add the server's default time limit, if configured and not set by the caller."""
+    raw = os.environ.get("CONVEX_OPT_MCP_TIME_LIMIT", "").strip()
+    key = _TIME_LIMIT_OPTION.get((solver or "").upper())
+    if not raw or key is None or key in options:
+        return dict(options)
+    return {**options, key: float(raw)}
+
+
+def _rule_violations(prob: cp.Problem, con_src: list[str], kind: str) -> str | None:
+    """Describe which parts break DCP/DGP/DQCP rules, or None if the problem follows them."""
+    check = {"dcp": "is_dcp", "dgp": "is_dgp", "dqcp": "is_dqcp"}[kind]
+    if getattr(prob, check)():
+        return None
+    where = []
+    if not getattr(prob.objective, check)():
+        where.append("the objective")
+    bad = [src for src, c in zip(con_src, prob.constraints) if not getattr(c, check)()]
+    if bad:
+        where.append("constraints " + ", ".join(repr(b) for b in bad))
+    return "; ".join(where) or "the problem as a whole"
 
 
 # ==========================================================================
@@ -618,6 +724,7 @@ def check_problem(problem: ProblemSpec) -> CheckResult:
         ok=True,
         is_dcp=prob.is_dcp(),
         is_dgp=prob.is_dgp(),
+        is_dqcp=prob.is_dqcp(),
         is_mixed_integer=prob.is_mixed_integer(),
         objective_curvature=prob.objective.expr.curvature,
         objective_is_dcp=prob.objective.is_dcp(),
@@ -633,9 +740,13 @@ def check_problem(problem: ProblemSpec) -> CheckResult:
 def solve_problem(
     problem: ProblemSpec,
     solver: str | None = None,
+    solver_options: dict[str, OptionValue] | None = None,
+    solver_path: list[Union[str, SolverChoice]] | None = None,
+    gp: bool = False,
+    qcp: bool = False,
     verbose: bool = False,
 ) -> SolveResult:
-    """Solve a convex (DCP) optimization problem with CVXPY.
+    """Solve a convex (DCP), geometric (gp) or quasiconvex (qcp) problem with CVXPY.
 
     Write the objective and constraints as Python/CVXPY expression strings over
     the declared variables, the parameters, `cp` (cvxpy) and `np` (numpy).
@@ -672,11 +783,28 @@ def solve_problem(
       - `cp.quad_form(x, P)` needs a symmetric PSD matrix P; use cp.sum_squares
         or cp.norm for other quadratic forms.
       - Minimizing a concave or maximizing a convex expression is not DCP; so is
-        multiplying two variables (x * y).
+        multiplying two variables (x * y), unless the problem is a geometric
+        program (see gp below).
       - `x * y` with a vector x and a matrix y is elementwise, not matrix multiplication.
 
+    Solve options (all optional):
+      solver: e.g. "CLARABEL", "SCS", "OSQP", "HIGHS"; list_solvers shows what is installed.
+      solver_options: passed to the solver as keyword arguments, e.g.
+        OSQP {"max_iter": 20000, "eps_abs": 1e-8, "eps_rel": 1e-8}; CLARABEL {"max_iter": 100,
+        "time_limit": 10}; SCS {"max_iters": 10000, "eps": 1e-6}; HIGHS {"time_limit": 10,
+        "presolve": "off"}; SCIPY {"scipy_options": {"method": "highs"}}.
+      solver_path: solvers to try in order until one runs without error (instead of
+        `solver`), e.g. ["CLARABEL", {"solver": "SCS", "options": {"max_iters": 10000}}].
+      gp: solve as a geometric program. Variables must be declared "pos": true and data
+        positive; products and powers of variables are then allowed, e.g.
+        {"variables": [{"name": "x", "shape": [3], "pos": true}], "sense": "minimize",
+         "objective": "cp.sum(x**2)", "constraints": ["x >= 1", "x[0] * x[1] <= 5"]}
+      qcp: solve a quasiconvex problem (e.g. with cp.ceil, cp.floor or ratios) by bisection.
+      Options naming files or folders (e.g. log_file) are refused, and options that are
+      arguments of this tool (gp, qcp, solver, verbose) can't go inside solver_options.
+
     Returns status, optimal value, variable values, constraint duals and solver
-    diagnostics (iterations, timings, max constraint violation).
+    diagnostics (iterations, timings, max constraint violation, options used).
 
     Dual sign convention (CVXPY's):
       - Inequality duals are always >= 0, however the constraint is written. A
@@ -687,43 +815,96 @@ def solve_problem(
         minimizing and +y*d when maximizing.
       - In Lagrangian terms: minimizing f, L = f + sum_i y_i * (lhs_i - rhs_i),
         with `a >= b` read as `b <= a`; maximizing f, the same with -f.
-    Variables and duals are only reported when the status is optimal or
-    optimal_inaccurate. Mixed-integer problems have no duals (they are null).
+    The optimal value, variables and duals are only reported when the status is
+    optimal or optimal_inaccurate (not for user_limit, infeasible, ...).
+    Mixed-integer and qcp problems have no duals (they are null). With gp, duals are
+    log-log sensitivities: a 1% loosening of a constraint improves the optimal
+    value by about y%.
     """
+    # 1. Check the options before building anything.
+    try:
+        if gp and qcp:
+            raise ValueError("gp and qcp can't both be true")
+        if solver and solver_path:
+            raise ValueError("Give either solver or solver_path, not both")
+        if solver_path is not None and not solver_path:
+            raise ValueError("solver_path is empty")
+        choices: list[tuple[str | None, dict[str, Any]]] = []
+        if solver_path:
+            for entry in solver_path:
+                if isinstance(entry, dict):  # not yet validated (direct Python calls)
+                    entry = SolverChoice.model_validate(entry)
+                if isinstance(entry, SolverChoice):
+                    choices.append((entry.solver, dict(entry.options)))
+                else:
+                    choices.append((entry, {}))
+        else:
+            choices.append((solver, dict(solver_options or {})))
+        if solver_path and solver_options:
+            raise ValueError("With solver_path, give options per solver: {'solver': ..., 'options': {...}}")
+        for name, opts in choices:
+            _check_options(opts, f"Options for {name or 'the default solver'}")
+    except ValueError as e:
+        return SolveResult(status="invalid_options", error=str(e))
+
+    # 2. Build the problem.
     try:
         prob, variables, con_src, from_store, from_files = _build(problem)
     except Exception as e:
         return SolveResult(status="build_error", error=str(e))
 
-    if not prob.is_dcp():
-        where = []
-        if not prob.objective.is_dcp():
-            where.append("the objective")
-        bad = [s for s, c in zip(con_src, prob.constraints) if not c.is_dcp()]
-        if bad:
-            where.append("constraints " + ", ".join(repr(s) for s in bad))
+    # 3. Check it follows the rules of the requested problem class.
+    kind = "dgp" if gp else "dqcp" if qcp else "dcp"
+    where = _rule_violations(prob, con_src, kind)
+    if where is not None:
+        hint = {
+            "dcp": "Reformulate it; check_problem gives details (is_dgp/is_dqcp show if gp or qcp would work).",
+            "dgp": "Geometric programs need variables declared \"pos\": true, positive data, and "
+            "monomial/posynomial expressions.",
+            "dqcp": "Reformulate it; check_problem gives details.",
+        }[kind]
         return SolveResult(
-            status="not_dcp",
-            error=(
-                f"Problem does not follow DCP rules ({'; '.join(where)}). "
-                "Reformulate it; check_problem gives details."
-            ),
+            status=f"not_{kind}",
+            error=f"Problem does not follow {kind.upper()} rules ({where}). {hint}",
             parameters_from_store=from_store,
             parameters_from_files=from_files,
         )
 
-    try:
-        prob.solve(solver=solver, verbose=verbose)
-    except cp.error.SolverError as e:
-        return SolveResult(status="solver_error", error=str(e), installed_solvers=cp.installed_solvers())
+    # 4. Solve, trying each solver in turn when solver_path is given.
+    mode = {"gp": True} if gp else {"qcp": True} if qcp else {}
+    attempts: list[dict[str, Any]] = []
+    used: dict[str, Any] | None = None
+    for name, opts in choices:
+        opts = _with_time_limit(name, opts)
+        try:
+            prob.solve(solver=name, verbose=verbose, **mode, **opts)
+        except Exception as e:  # unknown solver, bad option, solver failure
+            attempts.append({"solver": name, "ok": False, "error": f"{type(e).__name__}: {e}"})
+            continue
+        attempts.append({"solver": name, "ok": True})
+        used = {"solver": name, "gp": gp, "qcp": qcp, "solver_options": opts}
+        break
+
+    if used is None:
+        errors = "; ".join(f"{a['solver']}: {a['error']}" for a in attempts)
+        return SolveResult(
+            status="solver_error",
+            error=errors if len(attempts) == 1 else f"All solvers in solver_path failed ({errors})",
+            diagnostics=Diagnostics(attempts=attempts) if solver_path else None,
+            parameters_from_store=from_store,
+            parameters_from_files=from_files,
+            installed_solvers=cp.installed_solvers(),
+        )
 
     stats = prob.solver_stats
     diagnostics = Diagnostics(
-        solver=getattr(stats, "solver_name", None),
+        solver=getattr(stats, "solver_name", None) or used["solver"],
         solve_time_s=_finite_or_none(getattr(stats, "solve_time", None)),
         setup_time_s=_finite_or_none(getattr(stats, "setup_time", None)),
         compile_time_s=_finite_or_none(getattr(prob, "compilation_time", None)),
         num_iters=_int_or_none(getattr(stats, "num_iters", None)),
+        options_used=used,
+        attempts=attempts if solver_path else None,
     )
 
     solved = prob.status in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE)
@@ -732,7 +913,7 @@ def solve_problem(
 
     return SolveResult(
         status=prob.status,
-        optimal_value=_finite_or_none(prob.value),
+        optimal_value=_finite_or_none(prob.value) if solved else None,
         variables={k: _to_json(v.value) for k, v in variables.items()} if solved else None,
         duals={s: _to_json(c.dual_value) for s, c in zip(con_src, prob.constraints)} if solved else None,
         diagnostics=diagnostics,
